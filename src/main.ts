@@ -1,9 +1,12 @@
 import "./style.css";
+import { ACTIVITIES, transactionKeySet } from "./core/activity";
 import { runPipeline } from "./core/pipeline";
 import { PROFILES } from "./core/profiles";
 import { decodeBytes } from "./core/parse";
 import { type Field, type PipelineResult } from "./core/types";
 import { fillForType } from "./excel/styles";
+import { createActivityPanel } from "./ui/activityPanel";
+import { chip } from "./ui/dom";
 // ExcelJS est volumineux : on le charge a la demande (voir generate()).
 
 // --- Acces aux elements ----------------------------------------------------
@@ -27,7 +30,8 @@ const statsEl = $("stats");
 const mappingEl = $("mapping");
 const previewTable = $<HTMLTableElement>("preview");
 const previewCountEl = $("previewCount");
-const generateBtn = $<HTMLButtonElement>("generate");
+const activitiesEl = $("activities");
+const downloadsEl = $("downloads");
 const statusEl = $("status");
 
 // --- Etat ------------------------------------------------------------------
@@ -72,8 +76,13 @@ const FIELD_LABELS: Record<Field, string> = {
   bankId: "Identifiant bancaire",
   transactionId: "N° transaction",
   referenceId: "Réf. associée",
+  customerRef: "Numéro de client",
+  note: "Remarque",
   status: "État",
 };
+
+// Panneau des activites : affecte chaque operation a La Jocondienne / Duhalle.
+const panel = createActivityPanel(activitiesEl, { onChange: run });
 
 const argbToCss = (argb: string): string => `#${argb.slice(2)}`;
 const fmtDate = (d: Date | null, raw = ""): string =>
@@ -131,6 +140,7 @@ function run(): void {
       profileId: state.profileId,
       delimiter: state.delimiter || undefined,
       vatRate,
+      activity: panel.buildConfig(),
     });
     state.result = result;
 
@@ -141,10 +151,13 @@ function run(): void {
     }
 
     configEl.hidden = false;
+    activitiesEl.hidden = false;
     resultsEl.hidden = false;
+    panel.update(result.activityStats, transactionKeySet(result.transactions));
     renderStats(result);
     renderMapping(result);
     renderPreview(result);
+    renderDownloads(result);
     statusEl.textContent = "";
   } catch (err) {
     showError(`Erreur de traitement : ${(err as Error).message}`);
@@ -152,19 +165,6 @@ function run(): void {
 }
 
 // --- Rendu : statistiques ---------------------------------------------------
-function chip(label: string, value: string): HTMLElement {
-  const el = document.createElement("div");
-  el.className = "chip";
-  const l = document.createElement("span");
-  l.className = "chip-label";
-  l.textContent = label;
-  const v = document.createElement("span");
-  v.className = "chip-value";
-  v.textContent = value;
-  el.append(l, v);
-  return el;
-}
-
 function renderStats(result: PipelineResult): void {
   statsEl.innerHTML = "";
   const s = result.stats;
@@ -173,7 +173,7 @@ function renderStats(result: PipelineResult): void {
   statsEl.append(
     chip("Plateforme", result.profileLabel),
     chip("Mouvements", String(s.txCount)),
-    chip("🟢 Paiements", String(d.nbPaiements)),
+    chip("Paiements", String(d.nbPaiements)),
     chip("CA brut", euro(d.caBrut)),
     chip("Commissions", euro(d.commissions)),
     chip("Net encaissé", euro(d.netEncaisse)),
@@ -249,24 +249,44 @@ function renderPreview(result: PipelineResult): void {
   previewCountEl.textContent = `(${rows.length} sur ${result.transactions.length})`;
 }
 
+// --- Telechargements --------------------------------------------------------
+/** Un bouton pour le compte complet, puis un par activite (grise s'il n'y a rien a y mettre). */
+function renderDownloads(result: PipelineResult): void {
+  downloadsEl.replaceChildren();
+  const add = (label: string, activity: string | undefined, disabled = false): void => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = activity ? "btn-secondary" : "btn-primary";
+    button.textContent = label;
+    button.disabled = disabled;
+    button.addEventListener("click", () => void generate(activity));
+    downloadsEl.append(button);
+  };
+  add("⬇ Compte complet", undefined);
+  for (const { label } of ACTIVITIES) {
+    const n = result.activityStats.byActivity[label] ?? 0;
+    add(`⬇ ${label} (${n})`, label, n === 0);
+  }
+}
+
 // --- Generation Excel -------------------------------------------------------
-async function generate(): Promise<void> {
+async function generate(activity?: string): Promise<void> {
   if (!state.result) return;
   try {
-    generateBtn.disabled = true;
+    downloadsEl.querySelectorAll("button").forEach((b) => (b.disabled = true));
     statusEl.textContent = "Génération en cours…";
     const [{ buildWorkbook }, { buildFilename, downloadWorkbook }] = await Promise.all([
       import("./excel/workbook"),
       import("./excel/download"),
     ]);
-    const wb = buildWorkbook(state.result);
-    await downloadWorkbook(wb, buildFilename(state.fileName));
-    statusEl.textContent = "✓ Fichier Excel téléchargé";
+    const wb = buildWorkbook(state.result, { activity });
+    await downloadWorkbook(wb, buildFilename(state.fileName, activity));
+    statusEl.textContent = `✓ Fichier Excel téléchargé${activity ? ` (${activity})` : ""}`;
   } catch (err) {
     showError(`Échec de la génération : ${(err as Error).message}`);
     statusEl.textContent = "";
   } finally {
-    generateBtn.disabled = false;
+    if (state.result) renderDownloads(state.result); // retablit l'etat des boutons
   }
 }
 
@@ -308,6 +328,5 @@ delimiterSelect.addEventListener("change", () => {
   run();
 });
 vatInput.addEventListener("change", run);
-generateBtn.addEventListener("click", () => void generate());
 
 populateProfiles();

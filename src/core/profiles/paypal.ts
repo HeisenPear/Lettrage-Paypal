@@ -58,6 +58,9 @@ export const paypalProfile: Profile = {
       "Reference du numero de transaction associe",
       "Reference de la transaction associee",
     ],
+    // Selon la boutique, PayPal y recopie une signature (ex. "...Shop name: <boutique>").
+    customerRef: ["Numero de client", "Customer Number"],
+    note: ["Remarque", "Note"],
     status: ["Status", "Etat", "Statut"],
   },
 

@@ -1,9 +1,9 @@
+import { applyActivities, emptyActivityConfig, type ActivityConfig } from "./activity";
 import { parseCsvText } from "./csv";
 import { buildDashboard } from "./dashboard";
 import { applyLettrage } from "./lettrage";
 import { normalizeRows } from "./normalize";
 import { detectProfile, getProfile, type Profile } from "./profiles";
-import { buildMonthly } from "./summary";
 import type { PipelineResult, Transaction } from "./types";
 
 export interface PipelineOptions {
@@ -13,6 +13,8 @@ export interface PipelineOptions {
   delimiter?: string;
   /** Taux de TVA pour l'estimation de la synthese (0.20 par defaut). */
   vatRate?: number;
+  /** Regles d'affectation des operations aux activites (sinon : tout reste a affecter). */
+  activity?: ActivityConfig;
 }
 
 function chooseProfile(headers: string[], profileId?: string): Profile {
@@ -41,9 +43,10 @@ export function runPipeline(text: string, options: PipelineOptions = {}): Pipeli
   // Le lettrage s'appuie sur les positions d'origine : on l'applique avant
   // de trier pour l'affichage.
   const lettrage = applyLettrage(transactions);
+  // Les groupes d'operations liees (remboursement d'un paiement...) servent a propager l'activite.
+  const activityStats = applyActivities(transactions, options.activity ?? emptyActivityConfig());
   const ordered = [...transactions].sort(compareForOutput);
 
-  const monthly = buildMonthly(ordered, vatRate);
   const dashboard = buildDashboard(ordered);
 
   const currencies = [...new Set(ordered.map((t) => t.currency).filter(Boolean))].sort();
@@ -55,8 +58,8 @@ export function runPipeline(text: string, options: PipelineOptions = {}): Pipeli
     transactions: ordered,
     mapping,
     missingFields,
-    monthly,
     dashboard,
+    activityStats,
     stats: {
       rowCount: rows.length,
       txCount: ordered.length,

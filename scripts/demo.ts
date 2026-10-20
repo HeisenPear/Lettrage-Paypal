@@ -35,12 +35,16 @@ for (const t of result.transactions) {
   );
 }
 
-console.log("\nSynthese mensuelle :");
-for (const m of result.monthly) {
-  console.log(
-    `  ${m.monthLabel.padEnd(16)} CA TTC ${eur.format(m.caTtc).padStart(10)}  ` +
-      `frais ${eur.format(m.frais).padStart(9)}  retraits ${eur.format(m.retraitsBanque).padStart(10)}`
-  );
+const d = result.dashboard;
+console.log("\nVentes encaissees :");
+console.log(
+  `  ${d.nbPaiements} paiements | CA brut ${eur.format(d.caBrut)} | ` +
+    `commissions ${eur.format(d.commissions)} | net ${eur.format(d.netEncaisse)}`
+);
+
+console.log("\nActivites (aucune regle fournie : tout est a affecter sauf signatures reconnues) :");
+for (const [name, n] of Object.entries(result.activityStats.byActivity)) {
+  console.log(`  ${name.padEnd(16)} ${n}`);
 }
 
 const wb = buildWorkbook(result);
