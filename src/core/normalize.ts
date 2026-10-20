@@ -116,10 +116,14 @@ export function normalizeRows(
       bankId: get(row, "bankId"),
       transactionId: get(row, "transactionId"),
       referenceId: get(row, "referenceId"),
+      customerRef: get(row, "customerRef"),
+      note: get(row, "note"),
       status,
       pending,
       lettrage: "",
       group: 0,
+      activity: "",
+      activitySource: "",
     };
   });
 

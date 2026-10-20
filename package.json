@@ -9,7 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "demo": "tsx scripts/demo.ts"
+    "demo": "tsx scripts/demo.ts",
+    "test": "node --import tsx --test scripts/activity.test.ts"
   },
   "dependencies": {
     "exceljs": "^4.4.0",

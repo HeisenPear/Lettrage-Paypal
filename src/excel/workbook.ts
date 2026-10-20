@@ -1,4 +1,14 @@
 import ExcelJS from "exceljs";
+import { ACTIVITIES, UNASSIGNED } from "../core/activity";
+import {
+  impactsBalance,
+  isCredit,
+  isRefund,
+  isRemboursement,
+  isRetrait,
+  isSale,
+} from "../core/classify";
+import { norm } from "../core/profiles/profile";
 import type { PipelineResult, Transaction } from "../core/types";
 import { C, FONT, MONEY_FMT, MONEY_TOTAL, colLetter, fillForType, setFill } from "./styles";
 
@@ -68,27 +78,19 @@ function headerRow(
 const eur = (n: number): string =>
   `${n.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} €`;
 
-const norm = (s: string): string =>
-  (s ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim();
+/** Arrondi au centime : les totaux affiches s'additionnent exactement. */
+const r2 = (n: number): number => Math.round(n * 100) / 100;
 
-const isRetrait = (t: Transaction): boolean => norm(t.type).includes("retrait");
-const isRemboursement = (t: Transaction): boolean => norm(t.type).includes("remboursement");
-const isCredit = (t: Transaction): boolean =>
-  norm(t.impact).startsWith("cred") || (!t.impact && t.net >= 0);
 const isPayLater = (t: Transaction): boolean => norm(t.source).includes("pay later");
-const isVente = (t: Transaction): boolean => {
-  const n = norm(t.type);
-  if (/suspension|deblocage|annulation|retrait|remboursement|litige/.test(n)) return false;
-  return t.net > 0;
-};
-/** HT/TVA d'une ligne : ventes à partir du brut TTC, remboursements du net. */
+
+/** HT/TVA d'une ligne : ventes a partir du brut TTC, remboursements a partir du brut rembourse. */
 function htTvaForLine(t: Transaction, rate: number): { ht: number; tva: number } | null {
   let ttc: number | null = null;
-  if (isVente(t)) ttc = t.gross;
-  else if (isRemboursement(t)) ttc = t.net;
+  if (isSale(t)) ttc = t.gross;
+  else if (isRefund(t)) ttc = t.gross;
   if (ttc === null) return null;
-  const ht = ttc / (1 + rate);
-  return { ht, tva: ttc - ht };
+  const ht = r2(ttc / (1 + rate));
+  return { ht, tva: r2(ttc - ht) };
 }
 
 function timeMs(time: string): number {
@@ -119,8 +121,14 @@ const TX_WIDTHS = [12, 10, 28, 32, 12, 16, 15, 15, 10, 15, 20, 26, 22, 22, 34, 1
 function buildTransactions(wb: ExcelJS.Workbook, txs: Transaction[], rate: number): void {
   const ws = wb.addWorksheet("Transactions PayPal", { views: [{ state: "frozen", ySplit: 1 }] });
   const pct = Number((rate * 100).toFixed((rate * 100) % 1 ? 1 : 0));
-  const headers = [...TX_HEADERS, "Montant HT (€)", `TVA ${pct} % (€)`];
-  const widths = [...TX_WIDTHS, 15, 14];
+  const headers = [
+    ...TX_HEADERS,
+    "Montant HT (€)",
+    `TVA ${pct} % (€)`,
+    "Activité",
+    "Origine affectation",
+  ];
+  const widths = [...TX_WIDTHS, 15, 14, 18, 34];
   widths.forEach((w, i) => (ws.getColumn(i + 1).width = w));
   headerRow(ws, 1, headers, C.navy, 36, 10);
 
@@ -149,10 +157,17 @@ function buildTransactions(wb: ExcelJS.Workbook, txs: Transaction[], rate: numbe
     const vt = htTvaForLine(t, rate);
     put(ws, r, 19, vt ? vt.ht : "", { fill, ...money });
     put(ws, r, 20, vt ? vt.tva : "", { fill, ...money });
+    const unassigned = t.activity === UNASSIGNED;
+    put(ws, r, 21, t.activity, {
+      fill,
+      bold: true,
+      color: unassigned ? C.orange : C.ink,
+    });
+    put(ws, r, 22, t.activitySource, { fill, italic: true, size: 8, color: C.grayTxt });
     ws.getRow(r).height = 16;
     r += 1;
   }
-  ws.autoFilter = { from: "A1", to: `${colLetter(20)}1` };
+  ws.autoFilter = { from: "A1", to: `${colLetter(headers.length)}1` };
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +182,8 @@ interface Periode {
 
 function decouperParVirement(txs: Transaction[]): Periode[] {
   const retraits = txs.filter(isRetrait);
-  const others = txs.filter((t) => !isRetrait(t));
+  // Les lignes "Memo" (annulees / en attente) ne bougent pas le solde : elles n'entrent pas dans un virement.
+  const others = txs.filter((t) => !isRetrait(t) && impactsBalance(t));
   const bounds = retraits.map(stamp);
   const firstDate = txs.length ? txs[0].dateRaw : "";
 
@@ -199,10 +215,14 @@ function decouperParVirement(txs: Transaction[]): Periode[] {
   return periodes;
 }
 
+/** Mention ajoutee aux feuilles de virements d'un classeur d'activite. */
+const activityBankNote = (activity: string): string =>
+  `ℹ️  Virements globaux du compte PayPal (toutes activités confondues). Les nombres de transactions, les crédits nets et les sous-totaux ne concernent que l'activité ${activity}.`;
+
 // ---------------------------------------------------------------------------
 // 2. Virements Banque
 // ---------------------------------------------------------------------------
-function buildVirements(wb: ExcelJS.Workbook, periodes: Periode[]): void {
+function buildVirements(wb: ExcelJS.Workbook, periodes: Periode[], activity?: string): void {
   const ws = wb.addWorksheet("Virements Banque");
   [6, 14, 14, 18, 28, 18, 18, 22, 22, 16].forEach((w, i) => (ws.getColumn(i + 1).width = w));
 
@@ -220,7 +240,7 @@ function buildVirements(wb: ExcelJS.Workbook, periodes: Periode[]): void {
   let totalVire = 0;
   for (const p of periodes) {
     const fill = p.retrait ? "FFE3F2FD" : "FFFFFDE7";
-    const creditsNets = p.txs.filter(isCredit).reduce((s, t) => s + t.net, 0);
+    const creditsNets = r2(p.txs.filter(isCredit).reduce((s, t) => s + t.net, 0));
     const montant = p.retrait ? p.retrait.net : 0;
     totalVire += montant;
     put(ws, r, 1, num, { fill, align: "center", size: 10 });
@@ -243,7 +263,7 @@ function buildVirements(wb: ExcelJS.Workbook, periodes: Periode[]): void {
   ws.mergeCells(totalRow, 1, totalRow, 5);
   put(ws, totalRow, 1, "TOTAL VIREMENTS REÇUS EN BANQUE", { fill: C.dark, bold: true, color: C.white, align: "right", size: 10 });
   for (let c = 2; c <= 5; c++) setFill(ws.getCell(totalRow, c), C.dark);
-  put(ws, totalRow, 6, totalVire, { fill: C.dark, bold: true, color: C.white, align: "right", numFmt: MONEY_TOTAL, size: 11 });
+  put(ws, totalRow, 6, r2(totalVire), { fill: C.dark, bold: true, color: C.white, align: "right", numFmt: MONEY_TOTAL, size: 11 });
   for (let c = 7; c <= 10; c++) setFill(ws.getCell(totalRow, c), C.dark);
   ws.getRow(totalRow).height = 22;
 
@@ -251,6 +271,10 @@ function buildVirements(wb: ExcelJS.Workbook, periodes: Periode[]): void {
   band(ws, noteRow, 10,
     "ℹ️  Pour lettrer : Retrouvez chaque 'Identifiant bancaire' dans votre relevé bancaire. Le montant doit correspondre exactement à 'Montant viré'. Cochez la colonne ✓ Lettré.",
     { italic: true, size: 9, color: C.grayTxt, wrap: true });
+  if (activity) {
+    band(ws, noteRow + 1, 10, activityBankNote(activity), { italic: true, size: 9, color: C.orange, wrap: true });
+    ws.getRow(noteRow + 1).height = 26;
+  }
 }
 
 function lastBalance(txs: Transaction[]): number | string {
@@ -263,7 +287,7 @@ function lastBalance(txs: Transaction[]): number | string {
 // ---------------------------------------------------------------------------
 const RAP_SUB = ["#", "Date", "Heure", "Nom client", "Type transaction", "Brut (€)", "Commission (€)", "Net (€)", "Impact", "N° Facture", "N° Transaction"];
 
-function buildRapprochement(wb: ExcelJS.Workbook, periodes: Periode[]): void {
+function buildRapprochement(wb: ExcelJS.Workbook, periodes: Periode[], activity?: string): void {
   const ws = wb.addWorksheet("Rapprochement");
   [6, 13, 10, 26, 30, 13, 14, 14, 14, 22, 16].forEach((w, i) => (ws.getColumn(i + 1).width = w));
   band(ws, 1, 11, "RAPPROCHEMENT PAR VIREMENT  —  Toutes transactions groupées par période de virement", {
@@ -312,9 +336,9 @@ function buildRapprochement(wb: ExcelJS.Workbook, periodes: Periode[]): void {
     ws.mergeCells(r, 1, r, 5);
     put(ws, r, 1, `Sous-total période  (${nc} crédits / ${nd} débits)`, { fill: C.subtotal, bold: true });
     for (let c = 2; c <= 5; c++) setFill(ws.getCell(r, c), C.subtotal);
-    put(ws, r, 6, sb, { fill: C.subtotal, bold: true, align: "right", numFmt: MONEY_FMT });
-    put(ws, r, 7, sc, { fill: C.subtotal, bold: true, align: "right", numFmt: MONEY_FMT });
-    put(ws, r, 8, sn, { fill: C.subtotal, bold: true, align: "right", numFmt: MONEY_FMT });
+    put(ws, r, 6, r2(sb), { fill: C.subtotal, bold: true, align: "right", numFmt: MONEY_FMT });
+    put(ws, r, 7, r2(sc), { fill: C.subtotal, bold: true, align: "right", numFmt: MONEY_FMT });
+    put(ws, r, 8, r2(sn), { fill: C.subtotal, bold: true, align: "right", numFmt: MONEY_FMT });
     for (let c = 9; c <= 11; c++) setFill(ws.getCell(r, c), C.subtotal);
     r += 1;
 
@@ -333,6 +357,10 @@ function buildRapprochement(wb: ExcelJS.Workbook, periodes: Periode[]): void {
     }
     r += 1; // ligne vide
     if (p.retrait) vnum += 1;
+  }
+  if (activity) {
+    band(ws, r, 11, activityBankNote(activity), { italic: true, size: 9, color: C.orange, wrap: true });
+    ws.getRow(r).height = 26;
   }
 }
 
@@ -377,7 +405,7 @@ function buildRemboursements(wb: ExcelJS.Workbook, txs: Transaction[], byId: Map
   }
   ws.mergeCells(r, 1, r, 3);
   put(ws, r, 1, "TOTAL REMBOURSEMENTS", { fill: C.red, bold: true, color: C.white, align: "right", size: 10 });
-  put(ws, r, 4, total, { fill: C.red, bold: true, color: C.white, align: "right", numFmt: MONEY_TOTAL, size: 11 });
+  put(ws, r, 4, r2(total), { fill: C.red, bold: true, color: C.white, align: "right", numFmt: MONEY_TOTAL, size: 11 });
   for (let c = 5; c <= 11; c++) setFill(ws.getCell(r, c), C.red);
   ws.getRow(r).height = 22;
 
@@ -405,6 +433,7 @@ function buildAnomalies(wb: ExcelJS.Workbook, txs: Transaction[]): void {
     { title: "▌ SOLDE SUSPENDU POUR ENQUÊTE SUR UN LITIGE  —  Litige ouvert — fonds bloqués", label: "Solde suspendu pour enquête sur un litige", fill: "FFFFFDE7", head: C.anomHead, rows: txs.filter((t) => norm(t.type).includes("solde suspendu")) },
     { title: "▌ ANNULATION DE LA SUSPENSION POUR RÉSOLUTION DU LITIGE  —  Litige résolu — fonds libérés", label: "Annulation de la suspension pour résolution du litige", fill: "FFF1F8E9", head: C.anomHead, rows: txs.filter((t) => norm(t.type).includes("annulation de la suspension")) },
     { title: "▌ PAY LATER (Paiement en 4X)  —  Transactions financées par PayPal Credit", label: "Pay Later 4X", fill: "FFF3E5F5", head: C.purpleHead, rows: txs.filter(isPayLater) },
+    { title: "▌ PAIEMENTS ANNULÉS OU EN ATTENTE  —  Lignes « Mémo » sans impact sur le solde — non comptées dans le CA", label: "Annulé / en attente", fill: "FFEEEEEE", head: C.anomHead, rows: txs.filter((t) => !impactsBalance(t)) },
   ];
 
   let r = 2;
@@ -448,13 +477,14 @@ const RESUME_ORDER = [
   "Annulation de la suspension pour résolution du litige",
 ];
 
-function buildResume(wb: ExcelJS.Workbook, txs: Transaction[]): void {
+function buildResume(wb: ExcelJS.Workbook, txs: Transaction[], scope: string, control: boolean): void {
   const ws = wb.addWorksheet("Résumé");
   [36, 15, 15].forEach((w, i) => (ws.getColumn(i + 1).width = w));
-  headerRow(ws, 1, ["Résumé des transactions", "Nombre", "Montant net (€)"], C.navy, 28, 10);
+  headerRow(ws, 1, [`Résumé des transactions${scope}`, "Nombre", "Montant net (€)"], C.navy, 28, 10);
 
+  // Seules les lignes qui bougent le solde sont additionnees ; les "Memo" sont signalees a part.
   const groups = new Map<string, { count: number; net: number }>();
-  for (const t of txs) {
+  for (const t of txs.filter(impactsBalance)) {
     const g = groups.get(t.type) ?? { count: 0, net: 0 };
     g.count += 1;
     g.net += t.net;
@@ -473,10 +503,12 @@ function buildResume(wb: ExcelJS.Workbook, txs: Transaction[]): void {
     const fill = fillForType(type);
     put(ws, r, 1, type, { fill, size: 10 });
     put(ws, r, 2, g.count, { fill, align: "center", size: 10 });
-    put(ws, r, 3, g.net, { fill, size: 10, numFmt: MONEY_FMT });
+    put(ws, r, 3, r2(g.net), { fill, size: 10, numFmt: MONEY_FMT });
     if (g.net >= 0) credits += g.net; else debits += g.net;
     r += 1;
   }
+  credits = r2(credits);
+  debits = r2(debits);
   put(ws, r, 1, "TOTAL CRÉDITS", { fill: "FFE8F5E9", bold: true, size: 10 });
   put(ws, r, 2, "", { fill: "FFE8F5E9", size: 10 });
   const creditRow = r;
@@ -487,9 +519,51 @@ function buildResume(wb: ExcelJS.Workbook, txs: Transaction[]): void {
   const debitRow = r;
   put(ws, r, 3, debits, { fill: "FFFFEBEE", bold: true, size: 10, numFmt: MONEY_FMT });
   r += 1;
+  const soldeNet = r2(credits + debits);
   put(ws, r, 1, "SOLDE NET", { fill: C.navy, bold: true, color: C.white, size: 10 });
   put(ws, r, 2, "", { fill: C.navy, size: 10 });
-  put(ws, r, 3, { formula: `C${creditRow}+C${debitRow}` }, { fill: C.navy, bold: true, color: C.white, align: "right", size: 10, numFmt: MONEY_TOTAL });
+  const soldeRow = r;
+  put(ws, r, 3, { formula: `C${creditRow}+C${debitRow}`, result: soldeNet }, { fill: C.navy, bold: true, color: C.white, align: "right", size: 10, numFmt: MONEY_TOTAL });
+  r += 1;
+
+  const memo = txs.filter((t) => !impactsBalance(t));
+  const grey = "FFF1F1F1";
+  if (memo.length) {
+    r += 1;
+    put(ws, r, 1, "Lignes « Mémo » (annulées / en attente)", { fill: grey, italic: true, size: 10 });
+    put(ws, r, 2, memo.length, { fill: grey, align: "center", size: 10 });
+    put(ws, r, 3, r2(memo.reduce((s, t) => s + t.net, 0)), { fill: grey, size: 10, numFmt: MONEY_FMT });
+    r += 1;
+    put(ws, r, 1, "Hors solde et hors chiffre d'affaires (aucun impact sur le solde PayPal)", { italic: true, size: 8, color: C.grayTxt });
+    r += 1;
+  }
+
+  // Controle : le solde calcule doit retomber sur le solde affiche par PayPal.
+  const withBalance = txs.filter((t) => t.balance != null);
+  if (control && withBalance.length) {
+    const first = withBalance[0];
+    const last = withBalance[withBalance.length - 1];
+    const opening = r2((first.balance as number) - (impactsBalance(first) ? first.net : 0));
+    const closing = r2(opening + soldeNet);
+    const shown = r2(last.balance as number);
+    r += 1;
+    put(ws, r, 1, "Solde d'ouverture (déduit de la 1re ligne)", { size: 10 });
+    put(ws, r, 3, opening, { size: 10, numFmt: MONEY_FMT });
+    const openingRow = r;
+    r += 1;
+    put(ws, r, 1, "Solde de clôture calculé", { size: 10 });
+    put(ws, r, 3, { formula: `C${soldeRow}+C${openingRow}`, result: closing }, { size: 10, numFmt: MONEY_FMT });
+    const closingRow = r;
+    r += 1;
+    put(ws, r, 1, "Solde de clôture affiché par PayPal", { size: 10 });
+    put(ws, r, 3, shown, { size: 10, numFmt: MONEY_FMT });
+    const shownRow = r;
+    r += 1;
+    const gap = r2(closing - shown);
+    put(ws, r, 1, "ÉCART (doit être 0,00 €)", { bold: true, size: 10, fill: gap === 0 ? "FFE8F5E9" : "FFFFEBEE" });
+    put(ws, r, 2, "", { fill: gap === 0 ? "FFE8F5E9" : "FFFFEBEE" });
+    put(ws, r, 3, { formula: `ROUND(C${closingRow}-C${shownRow},2)`, result: gap }, { bold: true, size: 10, numFmt: MONEY_TOTAL, fill: gap === 0 ? "FFE8F5E9" : "FFFFEBEE" });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -526,106 +600,179 @@ const CA_MONTHS = [
   "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
 ];
 
-function buildCA(wb: ExcelJS.Workbook, txs: Transaction[], rate: number): void {
+const caHeaders = (first: string, pct: number): string[] => [
+  first, "Nb ventes", "CA brut TTC (€)", "Remboursements TTC (€)", "CA net TTC (€)",
+  `TVA collectée ${pct} % (€)`, "CA net HT (€)", "Commissions PayPal (€)", "Net encaissé (€)",
+];
+
+interface CaLine { key: string; label: string; nb: number; brut: number; remb: number; comm: number }
+
+/** Regroupe les ventes et remboursements comptabilisables selon `keyOf` (les cles de `order` d'abord). */
+function caLines(
+  txs: Transaction[],
+  keyOf: (t: Transaction) => { key: string; label: string },
+  order: string[] = []
+): CaLine[] {
+  const map = new Map<string, CaLine>();
+  for (const t of txs) {
+    const sale = isSale(t);
+    if (!sale && !isRefund(t)) continue;
+    const { key, label } = keyOf(t);
+    const g = map.get(key) ?? { key, label, nb: 0, brut: 0, remb: 0, comm: 0 };
+    if (sale) {
+      g.nb += 1;
+      g.brut += t.gross;
+    } else {
+      g.remb += t.gross; // le client recupere le TTC ; la commission eventuellement rendue va avec les commissions
+    }
+    g.comm += t.fee;
+    map.set(key, g);
+  }
+  const rank = (k: string): number => {
+    const i = order.indexOf(k);
+    return i === -1 ? order.length : i;
+  };
+  return [...map.values()].sort((a, b) => rank(a.key) - rank(b.key) || a.key.localeCompare(b.key));
+}
+
+/** Ecrit un tableau de CA + sa ligne TOTAL (somme des lignes arrondies). Retourne la ligne suivante libre. */
+function writeCaTable(
+  ws: ExcelJS.Worksheet,
+  start: number,
+  lines: CaLine[],
+  rate: number,
+  fillOf: (l: CaLine) => string
+): number {
+  const money = { align: "right" as const, numFmt: MONEY_FMT };
+  let r = start;
+  let tNb = 0, tBrut = 0, tRemb = 0, tNet = 0, tComm = 0, tEnc = 0;
+  for (const l of lines) {
+    const brut = r2(l.brut);
+    const remb = r2(l.remb);
+    const comm = r2(l.comm);
+    const netTtc = r2(brut + remb);
+    const ht = r2(netTtc / (1 + rate));
+    const tva = r2(netTtc - ht);
+    const enc = r2(netTtc + comm);
+    const fill = fillOf(l);
+    put(ws, r, 1, l.label, { fill });
+    put(ws, r, 2, l.nb, { fill, align: "center" });
+    put(ws, r, 3, brut, { fill, ...money });
+    put(ws, r, 4, remb, { fill, ...money });
+    put(ws, r, 5, netTtc, { fill, ...money });
+    put(ws, r, 6, tva, { fill, ...money });
+    put(ws, r, 7, ht, { fill, ...money });
+    put(ws, r, 8, comm, { fill, ...money });
+    put(ws, r, 9, enc, { fill, ...money });
+    tNb += l.nb; tBrut += brut; tRemb += remb; tNet += netTtc; tComm += comm; tEnc += enc;
+    r += 1;
+  }
+  // Comme pour une declaration de TVA, HT et TVA du total sont calcules sur le total TTC (et non en
+  // additionnant des lignes arrondies) : tous les tableaux d'une feuille affichent ainsi le meme total.
+  const tHt = r2(tNet / (1 + rate));
+  const tTva = r2(tNet - tHt);
+  const tot = { align: "right" as const, numFmt: MONEY_TOTAL, bold: true, color: C.white };
+  put(ws, r, 1, "TOTAL", { fill: C.dark, bold: true, color: C.white, align: "right" });
+  put(ws, r, 2, tNb, { fill: C.dark, bold: true, color: C.white, align: "center" });
+  put(ws, r, 3, r2(tBrut), { fill: C.dark, ...tot });
+  put(ws, r, 4, r2(tRemb), { fill: C.dark, ...tot });
+  put(ws, r, 5, r2(tNet), { fill: C.dark, ...tot });
+  put(ws, r, 6, tTva, { fill: C.dark, ...tot });
+  put(ws, r, 7, tHt, { fill: C.dark, ...tot });
+  put(ws, r, 8, r2(tComm), { fill: C.dark, ...tot });
+  put(ws, r, 9, r2(tEnc), { fill: C.dark, ...tot });
+  ws.getRow(r).height = 22;
+  return r + 1;
+}
+
+/** `all` : si fourni, ajoute la repartition du CA par activite (classeur du compte complet). */
+function buildCA(
+  wb: ExcelJS.Workbook,
+  txs: Transaction[],
+  rate: number,
+  scope: string,
+  all?: Transaction[]
+): void {
   const ws = wb.addWorksheet("Chiffre d'affaires", { views: [{ state: "frozen", ySplit: 2 }] });
   [16, 10, 18, 20, 18, 17, 16, 18, 16].forEach((w, i) => (ws.getColumn(i + 1).width = w));
   const pct = Number((rate * 100).toFixed((rate * 100) % 1 ? 1 : 0));
 
-  band(ws, 1, 9, `CHIFFRE D'AFFAIRES  —  TTC / TVA / HT  (TVA ${pct} %)`, {
+  band(ws, 1, 9, `CHIFFRE D'AFFAIRES  —  TTC / TVA / HT  (TVA ${pct} %)${scope}`, {
     fill: C.navy, bold: true, color: C.white, size: 13, align: "center", wrap: true,
   });
   ws.getRow(1).height = 34;
-  headerRow(ws, 2, [
-    "Mois", "Nb ventes", "CA brut TTC (€)", "Remboursements TTC (€)", "CA net TTC (€)",
-    `TVA collectée ${pct} % (€)`, "CA net HT (€)", "Commissions PayPal (€)", "Net encaissé (€)",
-  ], C.navy, 30, 10);
+  headerRow(ws, 2, caHeaders("Mois", pct), C.navy, 30, 10);
 
-  interface M { label: string; nb: number; brut: number; remb: number; comm: number }
-  const months = new Map<string, M>();
-  const key = (t: Transaction): string =>
-    t.date ? `${t.date.getFullYear()}-${String(t.date.getMonth() + 1).padStart(2, "0")}` : "0000-00";
-  const label = (k: string): string => {
-    const [y, m] = k.split("-");
-    const i = Number(m) - 1;
-    return i >= 0 && i < 12 ? `${CA_MONTHS[i]} ${y}` : "Sans date";
+  const month = (t: Transaction): { key: string; label: string } => {
+    if (!t.date) return { key: "0000-00", label: "Sans date" };
+    const m = t.date.getMonth();
+    const y = t.date.getFullYear();
+    return { key: `${y}-${String(m + 1).padStart(2, "0")}`, label: `${CA_MONTHS[m]} ${y}` };
   };
+  let r = writeCaTable(ws, 3, caLines(txs, month), rate, () => "FFE8F5E9");
 
-  for (const t of txs) {
-    if (!isVente(t) && !isRemboursement(t)) continue;
-    const k = key(t);
-    const g = months.get(k) ?? { label: label(k), nb: 0, brut: 0, remb: 0, comm: 0 };
-    if (isVente(t)) {
-      g.nb += 1;
-      g.brut += t.gross;
-      g.comm += t.fee;
-    } else {
-      g.remb += t.net;
-    }
-    months.set(k, g);
-  }
-
-  const money = { align: "right" as const, numFmt: MONEY_FMT };
-  const keys = [...months.keys()].sort();
-  let r = 3;
-  let tNb = 0, tBrut = 0, tRemb = 0, tComm = 0;
-  for (const k of keys) {
-    const g = months.get(k)!;
-    const netTtc = g.brut + g.remb;
-    const ht = netTtc / (1 + rate);
-    put(ws, r, 1, g.label, { fill: "FFE8F5E9" });
-    put(ws, r, 2, g.nb, { fill: "FFE8F5E9", align: "center" });
-    put(ws, r, 3, g.brut, { fill: "FFE8F5E9", ...money });
-    put(ws, r, 4, g.remb, { fill: "FFE8F5E9", ...money });
-    put(ws, r, 5, netTtc, { fill: "FFE8F5E9", ...money });
-    put(ws, r, 6, netTtc - ht, { fill: "FFE8F5E9", ...money });
-    put(ws, r, 7, ht, { fill: "FFE8F5E9", ...money });
-    put(ws, r, 8, g.comm, { fill: "FFE8F5E9", ...money });
-    put(ws, r, 9, netTtc + g.comm, { fill: "FFE8F5E9", ...money });
-    tNb += g.nb; tBrut += g.brut; tRemb += g.remb; tComm += g.comm;
-    r += 1;
-  }
-
-  const netTtcT = tBrut + tRemb;
-  const htT = netTtcT / (1 + rate);
-  const tot = { align: "right" as const, numFmt: MONEY_TOTAL, bold: true, color: C.white };
-  put(ws, r, 1, "TOTAL", { fill: C.dark, bold: true, color: C.white, align: "right" });
-  put(ws, r, 2, tNb, { fill: C.dark, bold: true, color: C.white, align: "center" });
-  put(ws, r, 3, tBrut, { fill: C.dark, ...tot });
-  put(ws, r, 4, tRemb, { fill: C.dark, ...tot });
-  put(ws, r, 5, netTtcT, { fill: C.dark, ...tot });
-  put(ws, r, 6, netTtcT - htT, { fill: C.dark, ...tot });
-  put(ws, r, 7, htT, { fill: C.dark, ...tot });
-  put(ws, r, 8, tComm, { fill: C.dark, ...tot });
-  put(ws, r, 9, netTtcT + tComm, { fill: C.dark, ...tot });
-  ws.getRow(r).height = 22;
-
-  band(ws, r + 2, 9,
-    `ℹ️  CA net TTC = ventes − remboursements.  TVA collectée = CA net TTC × ${pct}/${100 + pct}.  CA net HT = CA net TTC / ${(1 + rate).toFixed(2)}.  Les commissions PayPal sont des charges (déduites du net encaissé), sans TVA.`,
+  band(ws, r + 1, 9,
+    `ℹ️  CA net TTC = ventes − remboursements.  TVA collectée = CA net TTC × ${pct}/${100 + pct}.  CA net HT = CA net TTC / ${(1 + rate).toFixed(2)}.  Les commissions PayPal sont des charges (déduites du net encaissé), sans TVA.  Les paiements annulés ou en attente ne sont pas comptés. HT et TVA du TOTAL sont calculés sur le total TTC : une ligne peut différer d'un centime.`,
     { italic: true, size: 9, color: C.grayTxt, wrap: true });
+  ws.getRow(r + 1).height = 38;
+  r += 3;
+
+  if (all) {
+    band(ws, r, 9, "RÉPARTITION PAR ACTIVITÉ  —  Même période, ventilée selon l'activité affectée à chaque opération", {
+      fill: C.blue, bold: true, color: C.white, size: 11,
+    });
+    ws.getRow(r).height = 24;
+    r += 1;
+    headerRow(ws, r, caHeaders("Activité", pct), C.navy, 30, 10);
+    r += 1;
+    const activity = (t: Transaction): { key: string; label: string } => {
+      const label = t.activity || UNASSIGNED;
+      return { key: label, label };
+    };
+    const order = [...ACTIVITIES.map((a) => a.label), UNASSIGNED];
+    writeCaTable(ws, r, caLines(all, activity, order), rate, (l) =>
+      l.label === UNASSIGNED ? "FFFFF3E0" : "FFE8F5E9"
+    );
+  }
   ws.autoFilter = { from: "A2", to: "I2" };
 }
 
 // ---------------------------------------------------------------------------
 // Assemblage
 // ---------------------------------------------------------------------------
-export function buildWorkbook(result: PipelineResult): ExcelJS.Workbook {
+export interface WorkbookOptions {
+  /**
+   * Libelle d'une activite : le classeur ne contient alors que ses operations (memes feuilles,
+   * memes colonnes). Sans cette option : le compte complet, toutes activites confondues.
+   */
+  activity?: string;
+}
+
+export function buildWorkbook(result: PipelineResult, opts: WorkbookOptions = {}): ExcelJS.Workbook {
   const wb = new ExcelJS.Workbook();
   wb.creator = "Lettrage Auto";
   wb.created = new Date();
+  wb.calcProperties.fullCalcOnLoad = true; // Excel recalcule les formules (SOLDE NET, ecart) a l'ouverture
 
-  const txs = sortChrono(result.transactions);
+  const { activity } = opts;
+  const all = sortChrono(result.transactions);
+  // Classeur d'activite : ses operations seulement. Les virements, eux, restent ceux du compte.
+  const txs = activity ? all.filter((t) => t.activity === activity) : all;
+  const bankTxs = activity ? all.filter((t) => isRetrait(t) || t.activity === activity) : all;
   const byId = new Map<string, Transaction>();
-  for (const t of txs) if (t.transactionId) byId.set(t.transactionId, t);
-  const periodes = decouperParVirement(txs);
+  for (const t of all) if (t.transactionId) byId.set(t.transactionId, t);
+  const periodes = decouperParVirement(bankTxs);
   const rate = result.vatRate ?? 0.2;
+  const scope = activity ? `  —  ${activity}` : "";
+  wb.title = `Lettrage PayPal${scope}`;
 
   buildTransactions(wb, txs, rate);
-  buildVirements(wb, periodes);
-  buildRapprochement(wb, periodes);
+  buildVirements(wb, periodes, activity);
+  buildRapprochement(wb, periodes, activity);
   buildRemboursements(wb, txs, byId);
   buildAnomalies(wb, txs);
-  buildResume(wb, txs);
-  buildCA(wb, txs, rate);
+  buildResume(wb, txs, scope, !activity);
+  buildCA(wb, txs, rate, scope, activity ? undefined : all);
   buildLegende(wb);
 
   return wb;

@@ -28,12 +28,6 @@ export const CATEGORY_LABELS: Record<Category, string> = {
   AUTRE: "Autre",
 };
 
-/**
- * Statut de presentation (avec pastille) utilise dans les feuilles Excel,
- * inspire de la structure de lettrage cible.
- */
-export type Statut = "PAIEMENT" | "REMBOURSEMENT" | "RETRAIT" | "EN_ATTENTE" | "AUTRE";
-
 /** Une ligne brute du CSV : entete -> valeur texte. */
 export type RawRow = Record<string, string>;
 
@@ -60,10 +54,14 @@ export interface Transaction {
   bankId: string; // identifiant bancaire (pour les retraits)
   transactionId: string;
   referenceId: string; // numero de transaction associee
+  customerRef: string; // "Numero de client" : signature de la boutique (ex. nom de boutique)
+  note: string; // remarque libre
   status: string; // etat (Termine, En attente, Supprime...)
   pending: boolean; // operation en attente
   lettrage: string; // code de lettrage (rempli par le moteur)
   group: number; // identifiant interne du groupe lettre (0 = non lettre)
+  activity: string; // activite affectee (rempli par le moteur d'activites)
+  activitySource: string; // comment l'activite a ete determinee
 }
 
 /** Champs normalises que l'on cherche a mapper depuis les entetes du CSV. */
@@ -88,25 +86,12 @@ export type Field =
   | "bankId"
   | "transactionId"
   | "referenceId"
+  | "customerRef"
+  | "note"
   | "status";
 
 /** Resultat du mapping : pour chaque champ, l'entete reellement trouvee. */
 export type ResolvedMapping = Partial<Record<Field, string>>;
-
-/** Ligne de la feuille "Synthese mensuelle". */
-export interface MonthlyRow {
-  month: string; // "2026-01"
-  monthLabel: string; // "Janvier 2026"
-  count: number;
-  ventesBrut: number;
-  frais: number;
-  remboursements: number;
-  netEncaisse: number;
-  retraitsBanque: number;
-  caTtc: number;
-  tva: number;
-  caHt: number;
-}
 
 /** Indicateurs du tableau de bord (sur la periode de l'export). */
 export interface DashboardStats {
@@ -133,12 +118,19 @@ export interface PipelineStats {
   periodEnd: Date | null;
 }
 
+/** Bilan de l'affectation des operations aux activites. */
+export interface ActivityStats {
+  byActivity: Record<string, number>; // libelle d'activite -> nombre d'operations
+  bySource: Record<string, number>; // origine de l'affectation -> nombre d'operations
+  conflicts: number; // groupes lies dont les membres sont affectes a des activites differentes
+}
+
 export interface PipelineResult {
   transactions: Transaction[];
   mapping: ResolvedMapping;
   missingFields: Field[]; // champs essentiels introuvables
-  monthly: MonthlyRow[];
   dashboard: DashboardStats;
+  activityStats: ActivityStats;
   stats: PipelineStats;
   profileId: string;
   profileLabel: string;
